@@ -20,6 +20,7 @@
 (require "helix/editor.scm")
 (require "helix/misc.scm")
 (require "helix/components.scm")
+(require "helix/keymaps.scm")
 (require-builtin helix/core/text)
 (require-builtin steel/process)
 
@@ -168,6 +169,18 @@
   (cons (rope-line->char rope (Conflict-sep-line c))
         (+ (Conflict-last-char c) 1)))
 
+;; Bound only on buffers with an active conflict (see mark-conflict-active!
+;; below) - navigation as bare motions (]c/[c, matching Helix's own ]d/[d
+;; convention), resolution under a short space-c- prefix. Buffers without a
+;; conflict are completely unaffected; nothing here is global.
+(define CONFLICT-KEYMAP
+  (keymap (normal ("]" (c ":conflict-next"))
+                  ("[" (c ":conflict-prev"))
+                  (space (c (o ":conflict-accept-ours")
+                            (t ":conflict-accept-theirs")
+                            (a ":conflict-accept-both")
+                            (d ":conflict-accept-none"))))))
+
 ;; usize doc-ids of buffers with conflict highlighting active. A buffer stays
 ;; tracked until `conflict-clear`, so the document-changed hook keeps
 ;; re-highlighting it (e.g. after an undo restores a resolved conflict — script
@@ -178,9 +191,11 @@
   (doc-id->usize (editor->doc-id (editor-focus))))
 
 (define (mark-conflict-active!)
-  (define uid (current-doc-uid))
+  (define doc-id (editor->doc-id (editor-focus)))
+  (define uid (doc-id->usize doc-id))
   (unless (member uid (unbox *conflict-active-docs*))
-    (set-box! *conflict-active-docs* (cons uid (unbox *conflict-active-docs*)))))
+    (set-box! *conflict-active-docs* (cons uid (unbox *conflict-active-docs*)))
+    (buffer-set-keymap! doc-id CONFLICT-KEYMAP)))
 
 (define (unmark-conflict-active!)
   (define uid (current-doc-uid))
