@@ -21,6 +21,7 @@
 (require "helix/misc.scm")
 (require "helix/components.scm")
 (require "helix/keymaps.scm")
+(require "helix/buffer-types.scm")
 (require-builtin helix/core/text)
 (require-builtin steel/process)
 
@@ -35,7 +36,11 @@
          conflict-list
          conflict-files
          conflict-diff
-         conflict-diff-close)
+         conflict-diff-close
+         conflict-panel
+         conflict-panel-open-selected
+         conflict-panel-help
+         conflict-panel-close)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; Configuration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -47,6 +52,17 @@
 
 (define NS-OURS "git-conflict-ours")
 (define NS-THEIRS "git-conflict-theirs")
+
+;; Panel scopes/namespaces - separate from OURS-SCOPE/THEIRS-SCOPE above,
+;; which color the conflict regions inside a file, not the panel's own icons.
+(define ICON-DONE "")
+(define ICON-NOT-DONE "")
+(define ICON-DONE-SCOPE "diff.plus")
+(define ICON-TODO-SCOPE "warning")
+(define NS-PANEL-DONE "git-conflict-panel-done")
+(define NS-PANEL-TODO "git-conflict-panel-todo")
+(define PANEL-TYPE "git-conflict-panel")
+(define PANEL-HEADER "g? for commands")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; Utilities ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -383,10 +399,7 @@
 ;; the whole file; selecting one opens it and enters the ours/working/theirs diff
 ;; view (unless already in diff view).
 (define (conflict-files)
-  (define files
-    (filter (lambda (s) (not (equal? s "")))
-            (map str-trim
-                 (split-many (git-output (list "diff" "--name-only" "--diff-filter=U")) "\n"))))
+  (define files (conflicted-file-paths))
   (unless (null? files)
     (push-component!
      ;; #%exp-picker treats items as file paths, previews the whole file, and
@@ -479,6 +492,43 @@
         (filter (lambda (ln) (and (>= ln 1) (<= ln n))) linenos))
    scope))
 
+;; Builds ours | working | theirs around `path`, assuming the file at `path`
+;; is the currently focused buffer. No in-diff-view? guard here - callers
+;; (conflict-diff, or the panel's switch-file flow) decide when this runs.
+;;
+;; The ours/theirs side panes get a short bufferline label ("ours"/"theirs")
+;; since they'd otherwise share the working file's basename, indistinguishable
+;; in the tab bar at a glance.
+(define (build-diff-around-working path)
+  (define dir (path-parent path))
+  (define name (path-basename path))
+  (define ours (git-stage dir name 2))
+  (define theirs (git-stage dir name 3))
+  (define base (git-stage dir name 1))
+  (if (and (equal? ours "") (equal? theirs ""))
+      "conflict-diff: no merge-conflict stages for this file"
+      (let ([ours-file (write-side-file "ours" name ours)]
+            [theirs-file (write-side-file "theirs" name theirs)]
+            [base-file (write-side-file "base" name base)])
+        (define ours-changed (changed-lines base-file ours-file))
+        (define theirs-changed (changed-lines base-file theirs-file))
+        (set-box! *conflict-diff-files* (list ours-file theirs-file))
+        ;; Build ours | working | theirs, ending with focus on working.
+        (helix.vsplit-new)
+        (helix.open ours-file)
+        (set-bufferline-name! "ours")
+        (highlight-lines ours-changed OURS-SCOPE)
+        (helix.static.swap_view_left)
+        (helix.static.jump_view_right)
+        (helix.vsplit-new)
+        (helix.open theirs-file)
+        (set-bufferline-name! "theirs")
+        (highlight-lines theirs-changed THEIRS-SCOPE)
+        (helix.static.jump_view_left)
+        ;; Highlight the conflict regions in the (now focused) working buffer.
+        (refresh-conflict-highlights)
+        void)))
+
 ;;@doc
 ;; Open a 3-way split for the conflicted file under the cursor:
 ;; ours (HEAD) | working file | theirs (incoming), with lines that differ from
@@ -490,33 +540,7 @@
   (cond
     [(in-diff-view?) void]
     [(not path) "conflict-diff: current buffer has no file"]
-    [else
-     (define dir (path-parent path))
-     (define name (path-basename path))
-     (define ours (git-stage dir name 2))
-     (define theirs (git-stage dir name 3))
-     (define base (git-stage dir name 1))
-     (if (and (equal? ours "") (equal? theirs ""))
-         "conflict-diff: no merge-conflict stages for this file"
-         (let ([ours-file (write-side-file "ours" name ours)]
-               [theirs-file (write-side-file "theirs" name theirs)]
-               [base-file (write-side-file "base" name base)])
-           (define ours-changed (changed-lines base-file ours-file))
-           (define theirs-changed (changed-lines base-file theirs-file))
-           (set-box! *conflict-diff-files* (list ours-file theirs-file))
-           ;; Build ours | working | theirs, ending with focus on working.
-           (helix.vsplit-new)
-           (helix.open ours-file)
-           (highlight-lines ours-changed OURS-SCOPE)
-           (helix.static.swap_view_left)
-           (helix.static.jump_view_right)
-           (helix.vsplit-new)
-           (helix.open theirs-file)
-           (highlight-lines theirs-changed THEIRS-SCOPE)
-           (helix.static.jump_view_left)
-           ;; Highlight the conflict regions in the (now focused) working buffer.
-           (refresh-conflict-highlights)
-           void))]))
+    [else (build-diff-around-working path)]))
 
 ;;@doc
 ;; Close the ours/theirs side buffers opened by `conflict-diff`, leaving the
@@ -527,3 +551,262 @@
               (helix.buffer-close!))
             (unbox *conflict-diff-files*))
   (set-box! *conflict-diff-files* '()))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; Conflict panel ;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; State for the file-list panel. Kept separate from *conflict-diff-files*
+;; (the 3-way split's own state) - the two surfaces are independently
+;; closeable, see conflict-panel-close's doc comment.
+(define *conflict-panel-doc-id* (box #false))
+(define *conflict-panel-view-id* (box #false))
+(define *conflict-panel-files* (box '()))
+(define *conflict-diff-working-view* (box #false))
+;; Guards buffer-set-text! calls made by the panel's own refresh, so the
+;; buffer type's on-change self-heal below can't recursively re-trigger.
+(define *panel-rendering* (box #false))
+
+;; Every conflicted file in the repo - same source `conflict-files` uses.
+(define (conflicted-file-paths)
+  (filter (lambda (s) (not (equal? s "")))
+          (map str-trim
+               (split-many (git-output (list "diff" "--name-only" "--diff-filter=U")) "\n"))))
+
+;; #t when `path`, read fresh from disk, has no unresolved marker left. A read
+;; failure (file moved/deleted since the list was built) counts as done -
+;; there's nothing left to show as pending.
+(define (conflict-file-done? path)
+  (with-handler (lambda (_) #true)
+                (not (find-first (lambda (l) (marker? l #\<))
+                                  (split-many (read-port-to-string (open-input-file path)) "\n")))))
+
+;; (start . end) char range covering just the icon glyph on buffer line
+;; `line-idx` (0-based) - 2 leading spaces before it.
+(define (panel-icon-range rope line-idx)
+  (define start (+ (rope-line->char rope line-idx) 2))
+  (cons start (+ start 1)))
+
+;; Recomputes the file list + done/not-done text and highlights. Assumes the
+;; panel buffer is already the focused view.
+(define (render-panel!)
+  (define files (conflicted-file-paths))
+  (set-box! *conflict-panel-files* files)
+  (define n (length files))
+  (define statuses (map conflict-file-done? files))
+  (define (line-for i)
+    (string-append "  "
+                   (if (list-ref statuses i) ICON-DONE ICON-NOT-DONE)
+                   "  "
+                   (list-ref files i)))
+  (define body
+    (if (= n 0) "  (no unresolved conflicts)" (string-join (map line-for (range 0 n)) "\n")))
+  (set-box! *panel-rendering* #true)
+  (helix.static.buffer-set-text! (string-append PANEL-HEADER "\n" body))
+  (helix.static.buffer-mark-saved!)
+  (set-box! *panel-rendering* #false)
+  (if (= n 0)
+      (begin
+        (clear-document-highlights! NS-PANEL-DONE)
+        (clear-document-highlights! NS-PANEL-TODO))
+      (let* ([rope (current-doc-rope)]
+             [idxs (range 0 n)]
+             [done-idxs (filter (lambda (i) (list-ref statuses i)) idxs)]
+             [todo-idxs (filter (lambda (i) (not (list-ref statuses i))) idxs)])
+        (if (null? done-idxs)
+            (clear-document-highlights! NS-PANEL-DONE)
+            (set-document-highlights! NS-PANEL-DONE
+                                      (map (lambda (i) (panel-icon-range rope (+ i 1))) done-idxs)
+                                      ICON-DONE-SCOPE))
+        (if (null? todo-idxs)
+            (clear-document-highlights! NS-PANEL-TODO)
+            (set-document-highlights! NS-PANEL-TODO
+                                      (map (lambda (i) (panel-icon-range rope (+ i 1))) todo-idxs)
+                                      ICON-TODO-SCOPE)))))
+
+(define-buffer-type
+ PANEL-TYPE
+ (hash 'keymap (keymap (normal (ret ":conflict-panel-open-selected")
+                                (q ":conflict-panel-close")
+                                ;; A buffer-local "g" prefix shadows ALL of
+                                ;; Helix's native g-motions (gg, ge, gf, ...)
+                                ;; in this buffer, not just adding g? - keep
+                                ;; "gg" (the one most likely to be muscle
+                                ;; memory) working explicitly.
+                                (g (g "goto_file_start")
+                                   (? ":conflict-panel-help"))))
+       'on-close (lambda (doc-id)
+                   (set-box! *conflict-panel-doc-id* #false)
+                   (set-box! *conflict-panel-view-id* #false)
+                   (set-box! *conflict-panel-files* '()))
+       'on-change (lambda (doc-id old-text)
+                    (unless (unbox *panel-rendering*) (render-panel!)))))
+
+;; Absolute path for a repo-relative entry from *conflict-panel-files*, so it
+;; can be compared against current-file-path (always absolute).
+(define (panel-absolute-path rel)
+  (string-append (trim-end-matches (helix.static.get-helix-cwd) "/") "/" rel))
+
+;; The file to auto-open a diff for when the panel is first built: whatever
+;; was focused before it opened, if that's one of the conflicted files -
+;; otherwise the first file in the list (so the panel is never just an inert
+;; list with nothing shown next to it). #false if there are no conflicts.
+(define (panel-initial-target initial-path files)
+  (cond
+    [(null? files) #false]
+    [(and initial-path (member initial-path (map panel-absolute-path files))) initial-path]
+    [else (car files)]))
+
+;;@doc
+;; Open (or focus) the conflicted-files panel to the left of the editor;
+;; Enter opens the 3-way diff for a file, g? lists commands.
+(define (conflict-panel)
+  (if (and (unbox *conflict-panel-doc-id*) (editor-doc-exists? (unbox *conflict-panel-doc-id*)))
+      (begin
+        (editor-set-focus! (unbox *conflict-panel-view-id*))
+        (render-panel!))
+      (let ([initial-path (current-file-path)])
+        (helix.vsplit-new)
+        (set-box! *conflict-panel-doc-id* (create-buffer! PANEL-TYPE))
+        (helix.static.move-window-far-left)
+        (set-box! *conflict-panel-view-id* (editor-focus))
+        (set-scratch-buffer-name! "conflicts")
+        (set-bufferline-name! "conflicts")
+        (render-panel!)
+        ;; Deferred: render-panel!'s buffer-set-text! does not appear to take
+        ;; effect synchronously, so opening the diff split immediately
+        ;; afterward (moving focus on before it lands) can end up writing the
+        ;; panel's text into the just-opened working file instead. Letting
+        ;; this run on its own tick avoids the race.
+        (enqueue-thread-local-callback-with-delay
+         10
+         (lambda ()
+           (define target (panel-initial-target initial-path (unbox *conflict-panel-files*)))
+           (when target
+             (helix.vsplit-new)
+             (helix.open target)
+             (set-box! *conflict-diff-working-view* (editor-focus))
+             (build-diff-around-working target)))))))
+
+;;@doc
+;; Open or switch the 3-way diff to the conflicted file under the cursor in
+;; the panel.
+(define (conflict-panel-open-selected)
+  (define line (helix.static.get-current-line-number))
+  (define files (unbox *conflict-panel-files*))
+  (define idx (- line 1))
+  (when (and (>= idx 0) (< idx (length files)))
+    (define path (list-ref files idx))
+    (if (in-diff-view?)
+        (begin
+          ;; Move off the panel before touching diff state - conflict-diff-close
+          ;; operates on whatever view is currently focused.
+          (editor-set-focus! (unbox *conflict-diff-working-view*))
+          (conflict-diff-close)
+          (editor-set-focus! (unbox *conflict-diff-working-view*))
+          (helix.open path)
+          (build-diff-around-working path))
+        (begin
+          (helix.vsplit-new)
+          (helix.open path)
+          (set-box! *conflict-diff-working-view* (editor-focus))
+          (build-diff-around-working path)))))
+
+;;@doc
+;; Close the conflict panel (leaves any open diff untouched).
+(define (conflict-panel-close)
+  (helix.buffer-close!))
+
+;; Runs `thunk` with focus temporarily moved to the panel's view (if the
+;; panel is open), restoring the original focus afterward. Used so a
+;; document-saved refresh doesn't steal focus from wherever the user is.
+(define (with-panel-focus thunk)
+  (when (and (unbox *conflict-panel-doc-id*) (editor-doc-exists? (unbox *conflict-panel-doc-id*)))
+    (define saved (editor-focus))
+    (editor-set-focus! (unbox *conflict-panel-view-id*))
+    (thunk)
+    (editor-set-focus! saved)))
+
+;; Disk state (what the done/not-done icons reflect) only changes on save, so
+;; that's the only trigger the panel needs - Enter/navigation don't write
+;; anything themselves. Delayed slightly since document-saved appears to fire
+;; before the write is guaranteed to have landed on disk - reading the file
+;; immediately can see stale (pre-save) content.
+(register-hook 'document-saved
+               (lambda (doc-id)
+                 (enqueue-thread-local-callback-with-delay
+                  50
+                  (lambda () (with-panel-focus render-panel!)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; Help popup ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define CONFLICT-HELP-LINES
+  (list (cons "Git Conflict — commands" "ui.text.focus")
+        (cons "" "ui.text")
+        (cons "In a conflicted file:" "ui.text.focus")
+        (cons "  ]c            next conflict" "ui.text")
+        (cons "  [c            previous conflict" "ui.text")
+        (cons "  space c o     accept ours (HEAD)" "ui.text")
+        (cons "  space c t     accept theirs (incoming)" "ui.text")
+        (cons "  space c a     accept both" "ui.text")
+        (cons "  space c d     discard both" "ui.text")
+        (cons "" "ui.text")
+        (cons "In the conflict panel:" "ui.text.focus")
+        (cons "  ret           open / switch diff for file under cursor" "ui.text")
+        (cons "  g?            this help" "ui.text")
+        (cons "  q             close panel" "ui.text")
+        (cons "" "ui.text")
+        (cons "Typed commands:" "ui.text.focus")
+        (cons "  :conflict-panel         open the file panel" "ui.text")
+        (cons "  :conflict-highlight     highlight conflicts in current buffer" "ui.text")
+        (cons "  :conflict-clear         clear highlighting" "ui.text")
+        (cons "  :conflict-list          picker over conflicts in current buffer" "ui.text")
+        (cons "  :conflict-files         picker over conflicted files in repo" "ui.text")
+        (cons "  :conflict-diff          3-way diff for current file" "ui.text")
+        (cons "  :conflict-diff-close    close the diff side panes" "ui.text")))
+
+(define (conflict-help-render state rect frame)
+  (define lines CONFLICT-HELP-LINES)
+  (define total (length lines))
+  (define box-width
+    (min (max 10 (- (area-width rect) 4))
+         (max 50 (+ 4 (apply max 10 (map (lambda (p) (string-length (car p))) lines))))))
+  (define box-height (min (max 10 (- (area-height rect) 4)) (+ total 3)))
+  (define x (+ (area-x rect) (quotient (- (area-width rect) box-width) 2)))
+  (define y (+ (area-y rect) (quotient (- (area-height rect) box-height) 2)))
+  (define box-area (area x y box-width box-height))
+  (define shown (min (max 0 (- box-height 3)) total))
+  (buffer/clear frame box-area)
+  (block/render frame box-area (block))
+  (for-each (lambda (i)
+              (define p (list-ref lines i))
+              (frame-set-string! frame (+ x 2) (+ y 1 i) (car p) (theme-scope (cdr p))))
+            (range 0 shown))
+  (frame-set-string! frame (+ x 2) (+ y box-height -1) "press any key to close" (theme-scope "comment")))
+
+;; Dismiss on any key - this popup is informational only, nothing to select.
+(define (conflict-help-event-handler state event)
+  event-result/close)
+
+;;@doc
+;; Show a floating popup listing every git-conflict command and keybind.
+;;
+;; KNOWN ISSUE: this reliably works the first time push-component! is called
+;; in a session, but after the 3-way diff split has been built (conflict-diff
+;; / conflict-panel's auto-open), subsequent push-component! calls - from
+;; ANY buffer, via keymap or typed command, with or without an extra
+;; enqueue-thread-local-callback-with-delay wrapper - silently do nothing (no
+;; error, no panic, render never runs). Root cause not yet found; something
+;; about the vsplit-new/swap_view/jump_view choreography leaves the
+;; compositor unable to accept new layers afterward. Needs deeper
+;; investigation (comparing against a native picker/prompt push after the
+;; same split sequence would be a good next step) before this can be
+;; considered reliable.
+(define (conflict-panel-help)
+  (define comp
+    (new-component! "conflict-help"
+                    (hash)
+                    conflict-help-render
+                    (hash "handle_event" conflict-help-event-handler)))
+  ;; overlaid mutates comp in place and returns void - must not be nested
+  ;; inside push-component!.
+  (overlaid comp)
+  (push-component! comp))
