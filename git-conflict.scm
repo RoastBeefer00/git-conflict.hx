@@ -718,28 +718,34 @@
            (set-bufferline-name! "conflicts")
            (render-panel!)
            ;; Second deferral: same reasoning, this time for render-panel!'s
-           ;; buffer-set-text! before opening the diff split.
+           ;; buffer-set-text! before opening the diff split. Only auto-open
+           ;; a diff if one isn't ALREADY open - the panel can be closed with
+           ;; `q` while leaving its diff open (see conflict-panel-close's doc
+           ;; comment), and re-opening the panel in that state used to
+           ;; rebuild a second, redundant diff around whatever was focused
+           ;; instead of recognizing the existing one.
            (enqueue-thread-local-callback-with-delay
             10
             (lambda ()
-              (define target (panel-initial-target initial-path (unbox *conflict-panel-files*)))
-              (when target
-                (if (equal? target initial-path)
-                    ;; The file the user was already viewing is the one
-                    ;; being auto-opened - reuse that view as the working
-                    ;; pane instead of opening a second, redundant one.
-                    (begin
-                      (editor-set-focus! initial-view)
-                      (set-box! *conflict-diff-working-view* initial-view)
-                      (build-diff-around-working target))
-                    (begin
-                      (helix.vsplit-new)
-                      (enqueue-thread-local-callback-with-delay
-                       10
-                       (lambda ()
-                         (helix.open target)
-                         (set-box! *conflict-diff-working-view* (editor-focus))
-                         (build-diff-around-working target)))))))))))))
+              (unless (in-diff-view?)
+                (define target (panel-initial-target initial-path (unbox *conflict-panel-files*)))
+                (when target
+                  (if (equal? target initial-path)
+                      ;; The file the user was already viewing is the one
+                      ;; being auto-opened - reuse that view as the working
+                      ;; pane instead of opening a second, redundant one.
+                      (begin
+                        (editor-set-focus! initial-view)
+                        (set-box! *conflict-diff-working-view* initial-view)
+                        (build-diff-around-working target))
+                      (begin
+                        (helix.vsplit-new)
+                        (enqueue-thread-local-callback-with-delay
+                         10
+                         (lambda ()
+                           (helix.open target)
+                           (set-box! *conflict-diff-working-view* (editor-focus))
+                           (build-diff-around-working target))))))))))))))
 
 ;;@doc
 ;; Open or switch the 3-way diff to the conflicted file under the cursor in
@@ -849,24 +855,16 @@
             (range 0 shown))
   (frame-set-string! frame (+ x 2) (+ y box-height -1) "press any key to close" (theme-scope "comment")))
 
-;; Dismiss on any key - this popup is informational only, nothing to select.
+;; Dismiss on any KEY press - this popup is informational only, nothing to
+;; select. Must check key-event? first: handle_event fires on every event
+;; (resize, focus, paste, ...), not just key presses, and closing on any of
+;; those made the popup appear to close itself instantly - it was reacting
+;; to a non-key event delivered right after the keypress that opened it.
 (define (conflict-help-event-handler state event)
-  event-result/close)
+  (if (key-event? event) event-result/close event-result/ignore))
 
 ;;@doc
 ;; Show a floating popup listing every git-conflict command and keybind.
-;;
-;; KNOWN ISSUE: this reliably works the first time push-component! is called
-;; in a session, but after the 3-way diff split has been built (conflict-diff
-;; / conflict-panel's auto-open), subsequent push-component! calls - from
-;; ANY buffer, via keymap or typed command, with or without an extra
-;; enqueue-thread-local-callback-with-delay wrapper - silently do nothing (no
-;; error, no panic, render never runs). Root cause not yet found; something
-;; about the vsplit-new/swap_view/jump_view choreography leaves the
-;; compositor unable to accept new layers afterward. Needs deeper
-;; investigation (comparing against a native picker/prompt push after the
-;; same split sequence would be a good next step) before this can be
-;; considered reliable.
 (define (conflict-panel-help)
   (define comp
     (new-component! "conflict-help"
