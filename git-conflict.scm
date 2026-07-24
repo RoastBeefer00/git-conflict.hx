@@ -24,6 +24,7 @@
 (require "helix/buffer-types.scm")
 (require-builtin helix/core/text)
 (require-builtin steel/process)
+(require-builtin helix/core/keymaps as helix.keymaps.)
 
 (provide conflict-highlight
          conflict-clear
@@ -203,6 +204,20 @@
 ;; highlights are not part of the undo history and would otherwise be lost).
 (define *conflict-active-docs* (box '()))
 
+;; buffer-set-keymap! merges the given keymap onto an EMPTY base, and buffer
+;; keymap lookup never falls back to the global keymap once a sequence's
+;; first key matches something in the buffer-local trie at all - so a
+;; buffer-local map that only binds e.g. `space c o` silently swallows every
+;; OTHER `space`-prefixed global command (`space w h`, `space b`, ...) for
+;; that buffer, not just adds to them. Overlay onto a full copy of the global
+;; keymap instead, so only the keys we actually override change behavior.
+(define (buffer-set-keymap-with-fallback! doc-id overrides)
+  (define label (number->string (doc-id->usize doc-id)))
+  (helix.keymaps.#%add-extension-or-labeled-keymap
+   label
+   (merge-keybindings (deep-copy-global-keybindings) overrides))
+  (*reverse-buffer-map-insert* (doc-id->usize doc-id) label))
+
 (define (current-doc-uid)
   (doc-id->usize (editor->doc-id (editor-focus))))
 
@@ -211,7 +226,7 @@
   (define uid (doc-id->usize doc-id))
   (unless (member uid (unbox *conflict-active-docs*))
     (set-box! *conflict-active-docs* (cons uid (unbox *conflict-active-docs*)))
-    (buffer-set-keymap! doc-id CONFLICT-KEYMAP)))
+    (buffer-set-keymap-with-fallback! doc-id CONFLICT-KEYMAP)))
 
 (define (unmark-conflict-active!)
   (define uid (current-doc-uid))
