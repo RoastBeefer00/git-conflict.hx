@@ -570,8 +570,9 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; Conflict panel ;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; State for the file-list panel. Kept separate from *conflict-diff-files*
-;; (the 3-way split's own state) - the two surfaces are independently
-;; closeable, see conflict-panel-close's doc comment.
+;; (the 3-way split's own state) - :conflict-diff-close can still tear down
+;; just the diff on its own, but conflict-panel-close (q / space g c P)
+;; closes both together, see its doc comment.
 (define *conflict-panel-doc-id* (box #false))
 (define *conflict-panel-view-id* (box #false))
 (define *conflict-panel-files* (box '()))
@@ -719,11 +720,12 @@
            (render-panel!)
            ;; Second deferral: same reasoning, this time for render-panel!'s
            ;; buffer-set-text! before opening the diff split. Only auto-open
-           ;; a diff if one isn't ALREADY open - the panel can be closed with
-           ;; `q` while leaving its diff open (see conflict-panel-close's doc
-           ;; comment), and re-opening the panel in that state used to
-           ;; rebuild a second, redundant diff around whatever was focused
-           ;; instead of recognizing the existing one.
+           ;; a diff if one isn't ALREADY open - the panel's document can end
+           ;; up closed while its diff stays open (e.g. `:bc` on the panel
+           ;; directly, bypassing conflict-panel-close), and re-opening the
+           ;; panel in that state used to rebuild a second, redundant diff
+           ;; around whatever was focused instead of recognizing the
+           ;; existing one.
            (enqueue-thread-local-callback-with-delay
             10
             (lambda ()
@@ -780,9 +782,26 @@
              (build-diff-around-working path)))))))
 
 ;;@doc
-;; Close the conflict panel (leaves any open diff untouched).
+;; Close the whole conflict-resolution view: the panel and any open
+;; ours/theirs diff panes, leaving the working file focused.
+;;
+;; Closes by tracked path/view-id rather than "whatever's currently
+;; focused" - this is bound both to `q` in the panel's own buffer-local
+;; keymap AND globally (space g c P), and the global binding can fire while
+;; focus is on the working file, ours, theirs, or something else entirely.
+;; A plain (buffer-close!) would close whichever of those happened to be
+;; focused at the time instead of the intended targets.
 (define (conflict-panel-close)
-  (helix.buffer-close!))
+  (define working-view (unbox *conflict-diff-working-view*))
+  (for-each (lambda (f) (helix.buffer-close! f)) (unbox *conflict-diff-files*))
+  (set-box! *conflict-diff-files* '())
+  (when (and (unbox *conflict-panel-doc-id*) (editor-doc-exists? (unbox *conflict-panel-doc-id*)))
+    (editor-set-focus! (unbox *conflict-panel-view-id*))
+    (helix.buffer-close!))
+  ;; Best-effort: working-view may be stale (e.g. no diff was ever opened,
+  ;; or its pane was closed some other way) - guard rather than risk a
+  ;; panic from focusing a removed view.
+  (with-handler (lambda (_) void) (when working-view (editor-set-focus! working-view))))
 
 ;; Runs `thunk` with focus temporarily moved to the panel's own view (if the
 ;; panel is open), restoring the original focus afterward - regardless of
@@ -825,7 +844,7 @@
         (cons "In the conflict panel:" "ui.text.focus")
         (cons "  ret           open / switch diff for file under cursor" "ui.text")
         (cons "  g?            this help" "ui.text")
-        (cons "  q             close panel" "ui.text")
+        (cons "  q             close panel + diff" "ui.text")
         (cons "" "ui.text")
         (cons "Typed commands:" "ui.text.focus")
         (cons "  :conflict-panel         open the file panel" "ui.text")
