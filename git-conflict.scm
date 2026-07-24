@@ -602,6 +602,17 @@
 
 ;; Recomputes the file list + done/not-done text and highlights. Assumes the
 ;; panel buffer is already the focused view.
+;;
+;; Skips the actual buffer-set-text! when the freshly computed text is
+;; unchanged from what's already there. This matters beyond being a cheap
+;; optimization: the buffer type's on-change self-heal (below) calls this
+;; unconditionally whenever the panel's document changes, and that event
+;; fires asynchronously/debounced - NOT synchronously inside the
+;; buffer-set-text! call that triggered it - so *panel-rendering*'s guard
+;; (already unset by the time the event lands) can't prevent a second call
+;; from writing the same text again, which would itself trigger another
+;; document-changed event, forever. Making a no-change render a true no-op
+;; breaks that cycle.
 (define (render-panel!)
   (define files (conflicted-file-paths))
   (set-box! *conflict-panel-files* files)
@@ -614,10 +625,12 @@
                    (list-ref files i)))
   (define body
     (if (= n 0) "  (no unresolved conflicts)" (string-join (map line-for (range 0 n)) "\n")))
-  (set-box! *panel-rendering* #true)
-  (helix.static.buffer-set-text! (string-append PANEL-HEADER "\n" body))
-  (helix.static.buffer-mark-saved!)
-  (set-box! *panel-rendering* #false)
+  (define new-text (string-append PANEL-HEADER "\n" body))
+  (unless (equal? new-text (rope->string (current-doc-rope)))
+    (set-box! *panel-rendering* #true)
+    (helix.static.buffer-set-text! new-text)
+    (helix.static.buffer-mark-saved!)
+    (set-box! *panel-rendering* #false))
   (if (= n 0)
       (begin
         (clear-document-highlights! NS-PANEL-DONE)
@@ -652,8 +665,15 @@
                    (set-box! *conflict-panel-doc-id* #false)
                    (set-box! *conflict-panel-view-id* #false)
                    (set-box! *conflict-panel-files* '()))
+       ;; The on-change event for the panel's own text lands async/debounced,
+       ;; not synchronously inside the buffer-set-text! call that caused it -
+       ;; so focus may already have moved elsewhere (e.g. document-saved's
+       ;; deferred re-render already restored it to the working pane) by the
+       ;; time this fires. render-panel! assumes it's already focused on the
+       ;; panel, so re-establish that here rather than trusting ambient
+       ;; focus - see with-panel-focus below.
        'on-change (lambda (doc-id old-text)
-                    (unless (unbox *panel-rendering*) (render-panel!)))))
+                    (unless (unbox *panel-rendering*) (with-panel-focus render-panel!)))))
 
 ;; Absolute path for a repo-relative entry from *conflict-panel-files*, so it
 ;; can be compared against current-file-path (always absolute).
@@ -758,9 +778,13 @@
 (define (conflict-panel-close)
   (helix.buffer-close!))
 
-;; Runs `thunk` with focus temporarily moved to the panel's view (if the
-;; panel is open), restoring the original focus afterward. Used so a
-;; document-saved refresh doesn't steal focus from wherever the user is.
+;; Runs `thunk` with focus temporarily moved to the panel's own view (if the
+;; panel is open), restoring the original focus afterward - regardless of
+;; where focus actually is when called. Used both by the document-saved
+;; refresh below and by the buffer type's on-change self-heal, so neither
+;; steals focus from wherever the user is, and neither corrupts whatever
+;; buffer the user IS looking at by assuming (wrongly) that it's already on
+;; the panel.
 (define (with-panel-focus thunk)
   (when (and (unbox *conflict-panel-doc-id*) (editor-doc-exists? (unbox *conflict-panel-doc-id*)))
     (define saved (editor-focus))
