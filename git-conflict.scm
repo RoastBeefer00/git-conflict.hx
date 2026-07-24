@@ -663,28 +663,48 @@
       (begin
         (editor-set-focus! (unbox *conflict-panel-view-id*))
         (render-panel!))
-      (let ([initial-path (current-file-path)])
+      (let ([initial-path (current-file-path)]
+            [initial-view (editor-focus)])
         (helix.vsplit-new)
-        (set-box! *conflict-panel-doc-id* (create-buffer! PANEL-TYPE))
-        (helix.static.move-window-far-left)
-        (set-box! *conflict-panel-view-id* (editor-focus))
-        (set-scratch-buffer-name! "conflicts")
-        (set-bufferline-name! "conflicts")
-        (render-panel!)
-        ;; Deferred: render-panel!'s buffer-set-text! does not appear to take
-        ;; effect synchronously, so opening the diff split immediately
-        ;; afterward (moving focus on before it lands) can end up writing the
-        ;; panel's text into the just-opened working file instead. Letting
-        ;; this run on its own tick avoids the race.
+        ;; Deferred: vsplit-new does not appear to have taken effect by the
+        ;; time the very next Steel statement runs - calling create-buffer!
+        ;; immediately can end up replacing the ORIGINAL (pre-split) view's
+        ;; document instead of the new split's, silently overwriting
+        ;; whatever file the user had open with the panel's own text. Same
+        ;; underlying race as the one below (and worth treating as a general
+        ;; rule: never assume a split has landed on the very next line).
         (enqueue-thread-local-callback-with-delay
          10
          (lambda ()
-           (define target (panel-initial-target initial-path (unbox *conflict-panel-files*)))
-           (when target
-             (helix.vsplit-new)
-             (helix.open target)
-             (set-box! *conflict-diff-working-view* (editor-focus))
-             (build-diff-around-working target)))))))
+           (set-box! *conflict-panel-doc-id* (create-buffer! PANEL-TYPE))
+           (helix.static.move-window-far-left)
+           (set-box! *conflict-panel-view-id* (editor-focus))
+           (set-scratch-buffer-name! "conflicts")
+           (set-bufferline-name! "conflicts")
+           (render-panel!)
+           ;; Second deferral: same reasoning, this time for render-panel!'s
+           ;; buffer-set-text! before opening the diff split.
+           (enqueue-thread-local-callback-with-delay
+            10
+            (lambda ()
+              (define target (panel-initial-target initial-path (unbox *conflict-panel-files*)))
+              (when target
+                (if (equal? target initial-path)
+                    ;; The file the user was already viewing is the one
+                    ;; being auto-opened - reuse that view as the working
+                    ;; pane instead of opening a second, redundant one.
+                    (begin
+                      (editor-set-focus! initial-view)
+                      (set-box! *conflict-diff-working-view* initial-view)
+                      (build-diff-around-working target))
+                    (begin
+                      (helix.vsplit-new)
+                      (enqueue-thread-local-callback-with-delay
+                       10
+                       (lambda ()
+                         (helix.open target)
+                         (set-box! *conflict-diff-working-view* (editor-focus))
+                         (build-diff-around-working target)))))))))))))
 
 ;;@doc
 ;; Open or switch the 3-way diff to the conflicted file under the cursor in
@@ -703,12 +723,20 @@
           (conflict-diff-close)
           (editor-set-focus! (unbox *conflict-diff-working-view*))
           (helix.open path)
-          (build-diff-around-working path))
+          ;; Deferred defensively, same race as the branch below - open
+          ;; immediately followed by a dependent operation is the pattern
+          ;; that's proven unsafe elsewhere in this file.
+          (enqueue-thread-local-callback-with-delay 10 (lambda () (build-diff-around-working path))))
         (begin
           (helix.vsplit-new)
-          (helix.open path)
-          (set-box! *conflict-diff-working-view* (editor-focus))
-          (build-diff-around-working path)))))
+          ;; Deferred for the same reason as conflict-panel's create branch -
+          ;; vsplit-new has not reliably landed by the very next statement.
+          (enqueue-thread-local-callback-with-delay
+           10
+           (lambda ()
+             (helix.open path)
+             (set-box! *conflict-diff-working-view* (editor-focus))
+             (build-diff-around-working path)))))))
 
 ;;@doc
 ;; Close the conflict panel (leaves any open diff untouched).
